@@ -1,0 +1,64 @@
+name: Daily Factory
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # 01:00 UTC - skoro, hotove davno pred publik. slotom (cron sa moze oneskorit ~2-3h)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write          # commit stavu (used_topics.json, pushed.json, topics_bank.json)
+  models: read             # GitHub Models (generovanie tem zadarmo)
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+jobs:
+  generate-and-post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg + fonts
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+      - name: Install Python deps
+        run: pip install edge-tts requests cloudinary
+      - name: Prepare config
+        run: cp config.example.json config.json
+      - name: Top up topic bank (GitHub Models, free)
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python generate_topics.py
+      - name: Generate 3 videos + push to Buffer
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          BUFFER_TOKEN: ${{ secrets.BUFFER_TOKEN }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: |
+          python generate_batch.py 3
+          python push_to_buffer.py 3
+      - name: Retry failed Buffer posts (auto-heal)
+        continue-on-error: true
+        env:
+          BUFFER_TOKEN: ${{ secrets.BUFFER_TOKEN }}
+        run: python retry_failed.py
+      - name: Cleanup old Cloudinary videos
+        continue-on-error: true
+        env:
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: python cleanup_cloudinary.py
+      - name: Persist state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          rm -f config.json
+          git add used_topics.json pushed.json topics_bank.json scripts/ 2>/dev/null || true
+          git commit -m "state: daily run $(date -u +%F)" || echo "no changes"
+          git push || echo "nothing to push"
